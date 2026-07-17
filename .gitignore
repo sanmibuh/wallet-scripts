@@ -1,0 +1,5 @@
+# IDE
+.idea
+
+# Ignore generated configuration file
+config/wallet.conf
