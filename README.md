@@ -25,15 +25,26 @@ To reconfigure later, simply run `./setup.sh` again.
 ### 2. Test Manually
 
 ```bash
+# Daily backup (last 7 days) — default mode
 ./bin/backup
+
+# Or explicitly:
+./bin/backup daily
+
+# Full previous calendar month
+./bin/backup monthly
 ```
 
 ### 3. Automate with Crontab
 
 ```bash
 crontab -e
-# Run a backup every day at 2 AM
-0 2 * * * /path/to/wallet-scripts/bin/backup
+
+# Daily backup every night at 2 AM (last 7 days, file is overwritten each run)
+0 2 * * * /path/to/wallet-scripts/bin/backup daily >> /tmp/wallet-backup.log 2>&1
+
+# Monthly backup on the 15th of each month at 3 AM (full previous month, permanent file)
+0 3 15 * * /path/to/wallet-scripts/bin/backup monthly >> /tmp/wallet-backup.log 2>&1
 ```
 
 That's it! 🎉
@@ -56,33 +67,69 @@ wallet-scripts/
 
 ## ⏰ Automation with Crontab
 
-**This is the main use case for these scripts.** Schedule automatic backups at specific times.
+**This is the main use case for these scripts.** Two complementary backup jobs cover different recovery scenarios.
+
+### Backup Strategy
+
+| Mode | Command | Frequency | Content | File |
+|------|---------|-----------|---------|------|
+| `daily` | `bin/backup daily` | Every night | Last 7 days of records + current snapshot of accounts, categories, budgets, labels | `backups/daily/wallet-daily-YYYY-MM-DD.json` (overwritten each run) |
+| `monthly` | `bin/backup monthly` | 15th of each month | Full previous calendar month records + snapshot | `backups/monthly/wallet-monthly-YYYY-MM.json` (permanent) |
+
+**Why 7 days for daily?**
+Bank-synced transactions often arrive 2–3 days late, and manual edits can touch records from the past few days. A 7-day window ensures nothing is missed.
+
+**Why the 15th for monthly?**
+Running on the 1st risks missing late-arriving bank transactions from the final days of the previous month. The 15th gives a safe margin while the month is still fresh.
+
+### Recommended Crontab
 
 ```bash
 # Edit your crontab
 crontab -e
 
-# Run backup every day at 2 AM
-0 2 * * * /path/to/wallet-scripts/bin/backup
+# Daily backup — every night at 2 AM
+# Covers last 7 days. File is overwritten each run (no accumulation).
+0 2 * * * /path/to/wallet-scripts/bin/backup daily >> /tmp/wallet-backup.log 2>&1
 
-# Run backup every Sunday at 3 AM
-0 3 * * 0 /path/to/wallet-scripts/bin/backup
-
-# With logging
-0 2 * * * /path/to/wallet-scripts/bin/backup >> /tmp/wallet-backup.log 2>&1
+# Monthly backup — 15th of each month at 3 AM
+# Full previous calendar month. File is permanent and never overwritten.
+0 3 15 * * /path/to/wallet-scripts/bin/backup monthly >> /tmp/wallet-backup.log 2>&1
 ```
 
 **Important:** Always use absolute paths in crontab!
 
 ```bash
-# Test manually first
-./bin/backup
+# Good
+0 2 * * * /home/user/wallet-scripts/bin/backup daily
 
-# Check crontab logs (macOS)
+# Bad
+0 2 * * * ~/wallet-scripts/bin/backup daily
+```
+
+### Backup File Structure
+
+```
+backups/
+├── daily/
+│   └── wallet-daily-2026-07-20.json    ← overwritten each night
+└── monthly/
+    ├── wallet-monthly-2026-05.json     ← permanent
+    └── wallet-monthly-2026-06.json     ← permanent
+```
+
+### Debugging Cron Jobs
+
+```bash
+# Check cron logs (macOS)
 log show --predicate 'process == "cron"' --last 1h
 
 # Check system log (Linux)
 grep CRON /var/log/syslog
+
+# Run manually to verify before scheduling
+./bin/backup daily
+./bin/backup monthly
 ```
 
 ### Automatic Updates (Optional)
@@ -144,11 +191,12 @@ Open your browser and navigate to: `http://localhost:8000`
 
 Login with the credentials you set in `BASIC_AUTH_USER` and `BASIC_AUTH_PWD`.
 
-In the web interface, you can add cron jobs that run your wallet scripts:
+In the web interface, add both cron jobs:
 
-- **Expression**: `0 2 * * *` (2 AM every day)
-- **Command**: `/scripts/wallet/bin/backup`
-- **Name**: Daily wallet backup
+| Name | Expression | Command |
+|------|-----------|---------|
+| Daily wallet backup | `0 2 * * *` | `/scripts/wallet/bin/backup daily` |
+| Monthly wallet backup | `0 3 15 * *` | `/scripts/wallet/bin/backup monthly` |
 
 The UI provides a visual cron expression builder and validation to make scheduling easier.
 
@@ -308,16 +356,16 @@ The setup script should do this automatically, but you can run it manually if ne
 
    ```bash
    # Good
-   0 2 * * * /home/user/wallet-scripts/bin/backup
+   0 2 * * * /home/user/wallet-scripts/bin/backup daily
 
    # Bad
-   0 2 * * * ~/wallet-scripts/bin/backup
+   0 2 * * * ~/wallet-scripts/bin/backup daily
    ```
 
 2. Add logging to debug:
 
    ```bash
-   0 2 * * * /path/to/wallet-scripts/bin/backup >> /tmp/wallet.log 2>&1
+   0 2 * * * /path/to/wallet-scripts/bin/backup daily >> /tmp/wallet.log 2>&1
    ```
 
 3. Check cron logs:
@@ -337,8 +385,9 @@ The setup script should do this automatically, but you can run it manually if ne
 Always run scripts manually first to verify behavior before adding to crontab:
 
 ```bash
-./bin/backup
-# Verify it worked, then add to crontab
+./bin/backup daily
+./bin/backup monthly
+# Verify output, then add to crontab
 ```
 
 ### 2. Backup Your Configuration
@@ -354,5 +403,6 @@ cp config/wallet.conf config/wallet.conf.backup
 Always redirect output to a log file when running from crontab:
 
 ```bash
-0 2 * * * /path/to/wallet-scripts/bin/backup >> /tmp/wallet-backup.log 2>&1
+0 2 * * *    /path/to/wallet-scripts/bin/backup daily   >> /tmp/wallet-backup.log 2>&1
+0 3 15 * *   /path/to/wallet-scripts/bin/backup monthly >> /tmp/wallet-backup.log 2>&1
 ```
