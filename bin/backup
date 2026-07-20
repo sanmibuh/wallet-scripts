@@ -1,12 +1,14 @@
 #!/bin/sh
 
-# backup - Wallet full backup for a given day
+# backup - Wallet backup script
 #
-# Usage: backup [DATE]
-#   DATE  Reference date in YYYY-MM-DD format (default: today).
-#         The script backs up data from the DAY BEFORE this date.
+# Usage:
+#   backup [daily]    — backs up the last 7 days (default)
+#   backup monthly    — backs up the full previous calendar month
 #
-# The backup is saved to <project>/backups/wallet-backup-<BACKUP_DATE>.json
+# Backup files:
+#   backups/daily/wallet-daily-YYYY-MM-DD.json     (overwritten each run)
+#   backups/monthly/wallet-monthly-YYYY-MM.json    (permanent)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "$SCRIPT_DIR/lib/wallet-common.sh"
@@ -23,43 +25,80 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# Resolve reference date and compute backup date (day before)
+# Parse mode argument
 # ---------------------------------------------------------------------------
-if [ -n "$1" ]; then
-    REF_DATE="$1"
-else
-    REF_DATE="$(date '+%Y-%m-%d')"
+MODE="${1:-daily}"
+
+if [ "$MODE" != "daily" ] && [ "$MODE" != "monthly" ]; then
+    log "ERROR" "Unknown mode: '$MODE'. Use 'daily' or 'monthly'."
+    exit 1
 fi
 
-# Compute the day before REF_DATE (portable: macOS + Linux)
-if date --version >/dev/null 2>&1; then
-    # GNU date (Linux)
-    BACKUP_DATE="$(date -d "${REF_DATE} -1 day" '+%Y-%m-%d')"
+# ---------------------------------------------------------------------------
+# Date helpers (portable: macOS BSD date + GNU date)
+# ---------------------------------------------------------------------------
+date_offset() {
+    # date_offset YYYY-MM-DD N  → date N days from that date (N can be negative)
+    base="$1"
+    days="$2"
+    if date --version >/dev/null 2>&1; then
+        date -d "${base} ${days} days" '+%Y-%m-%d'
+    else
+        date -j -v"${days}d" -f '%Y-%m-%d' "${base}" '+%Y-%m-%d'
+    fi
+}
+
+today="$(date '+%Y-%m-%d')"
+current_year="$(date '+%Y')"
+current_month="$(date '+%m')"
+
+# ---------------------------------------------------------------------------
+# Resolve date range and output paths based on mode
+# ---------------------------------------------------------------------------
+if [ "$MODE" = "daily" ]; then
+    # Last 7 days (from 7 days ago up to and including yesterday)
+    DATE_FROM="$(date_offset "$today" -7)"
+    DATE_TO="$(date_offset "$today" -1)"
+    BACKUP_SUBDIR="$SCRIPT_DIR/backups/daily"
+    BACKUP_FILE="$BACKUP_SUBDIR/wallet-daily-${today}.json"
+    RANGE_DESC="last 7 days ($DATE_FROM → $DATE_TO)"
+
 else
-    # BSD date (macOS)
-    BACKUP_DATE="$(date -j -v-1d -f '%Y-%m-%d' "${REF_DATE}" '+%Y-%m-%d')"
+    # Full previous calendar month
+    # Subtract one month to get the target month
+    if date --version >/dev/null 2>&1; then
+        # GNU date
+        TARGET_YEAR="$(date -d "${today} -1 month" '+%Y')"
+        TARGET_MONTH="$(date -d "${today} -1 month" '+%m')"
+    else
+        # BSD date: go back 1 month
+        TARGET_YEAR="$(date -j -v-1m -f '%Y-%m-%d' "${today}" '+%Y')"
+        TARGET_MONTH="$(date -j -v-1m -f '%Y-%m-%d' "${today}" '+%m')"
+    fi
+
+    DATE_FROM="${TARGET_YEAR}-${TARGET_MONTH}-01"
+    # First day of current month minus 1 day = last day of target month
+    FIRST_CURRENT="${current_year}-${current_month}-01"
+    DATE_TO="$(date_offset "$FIRST_CURRENT" -1)"
+
+    BACKUP_SUBDIR="$SCRIPT_DIR/backups/monthly"
+    BACKUP_FILE="$BACKUP_SUBDIR/wallet-monthly-${TARGET_YEAR}-${TARGET_MONTH}.json"
+    RANGE_DESC="month ${TARGET_YEAR}-${TARGET_MONTH} ($DATE_FROM → $DATE_TO)"
 fi
 
-BACKUP_DIR="$SCRIPT_DIR/backups"
-BACKUP_FILE="$BACKUP_DIR/wallet-backup-${BACKUP_DATE}.json"
-
-mkdir -p "$BACKUP_DIR"
+mkdir -p "$BACKUP_SUBDIR"
 
 # Temp dir cleaned up on exit
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-log "INFO" "Starting backup for date: $BACKUP_DATE (reference: $REF_DATE)"
+log "INFO" "Starting $MODE backup — $RANGE_DESC"
 
 # ---------------------------------------------------------------------------
 # fetch_resource <resource> <response_key> <limit> <out_file> [extra_params]
 #
-# Fetches all pages of a resource and writes a single JSON array to <out_file>.
-# Never passes JSON through shell variables to avoid echo/\n corruption.
-#
-# The API wraps items under the resource name:
-#   GET /accounts  → {"accounts": [...], "nextOffset": 50}
-#   GET /records   → {"records": [...], "nextOffset": 200}
+# Fetches all pages and writes a single JSON array to <out_file>.
+# All JSON is handled via files to avoid shell echo/\n corruption.
 # ---------------------------------------------------------------------------
 fetch_resource() {
     resource="$1"
@@ -89,7 +128,6 @@ fetch_resource() {
             exit 1
         fi
 
-        # Detect API-level errors
         api_error="$(jq -r '.error // empty' "$page_file" 2>/dev/null)"
         if [ -n "$api_error" ]; then
             api_msg="$(jq -r '.message // empty' "$page_file" 2>/dev/null)"
@@ -97,7 +135,6 @@ fetch_resource() {
             exit 1
         fi
 
-        # Merge page items into combined array (all via files, no shell variables)
         jq -s --arg key "$resp_key" \
             '.[0] + (.[1][$key] // [])' \
             "$combined_file" "$page_file" > "$tmp_file" \
@@ -114,8 +151,7 @@ fetch_resource() {
 }
 
 # ---------------------------------------------------------------------------
-# Fetch all resources into temp files
-# Per-resource page limits (API enforces different maxes per endpoint)
+# Fetch static resources (current snapshot — same for both modes)
 # ---------------------------------------------------------------------------
 log "INFO" "Fetching accounts..."
 fetch_resource "accounts"   "accounts"   "200" "$TMP_DIR/accounts.json"   ""
@@ -129,16 +165,22 @@ fetch_resource "budgets"    "budgets"    "20"  "$TMP_DIR/budgets.json"    ""
 log "INFO" "Fetching labels..."
 fetch_resource "labels"     "labels"     "200" "$TMP_DIR/labels.json"     ""
 
-log "INFO" "Fetching records for $BACKUP_DATE..."
-fetch_resource "records"    "records"    "200" "$TMP_DIR/records.json"    "&recordDate=eq.${BACKUP_DATE}"
+# ---------------------------------------------------------------------------
+# Fetch records for the date range
+# ---------------------------------------------------------------------------
+log "INFO" "Fetching records ($DATE_FROM → $DATE_TO)..."
+fetch_resource "records" "records" "200" "$TMP_DIR/records.json" \
+    "&recordDate=gte.${DATE_FROM}&recordDate=lte.${DATE_TO}"
 
 # ---------------------------------------------------------------------------
-# Assemble final backup JSON entirely via files (no shell variables for JSON)
+# Assemble final backup JSON
 # ---------------------------------------------------------------------------
 log "INFO" "Assembling backup file: $BACKUP_FILE"
 
 jq -n \
-    --arg      backup_date  "$BACKUP_DATE" \
+    --arg      mode         "$MODE" \
+    --arg      date_from    "$DATE_FROM" \
+    --arg      date_to      "$DATE_TO" \
     --arg      generated_at "$(date '+%Y-%m-%d %H:%M:%S')" \
     --arg      base_url     "$BASE_URL" \
     --slurpfile accounts    "$TMP_DIR/accounts.json" \
@@ -147,7 +189,9 @@ jq -n \
     --slurpfile labels      "$TMP_DIR/labels.json" \
     --slurpfile records     "$TMP_DIR/records.json" \
     '{
-        backup_date:  $backup_date,
+        mode:         $mode,
+        date_from:    $date_from,
+        date_to:      $date_to,
         generated_at: $generated_at,
         base_url:     $base_url,
         accounts:     $accounts[0],
@@ -163,7 +207,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Summary (counts read from temp files, never from shell variables)
+# Summary
 # ---------------------------------------------------------------------------
 account_count="$(jq 'length' "$TMP_DIR/accounts.json")"
 category_count="$(jq 'length' "$TMP_DIR/categories.json")"
@@ -171,11 +215,37 @@ budget_count="$(jq 'length'   "$TMP_DIR/budgets.json")"
 label_count="$(jq 'length'    "$TMP_DIR/labels.json")"
 record_count="$(jq 'length'   "$TMP_DIR/records.json")"
 
-log "INFO" "Backup complete: $BACKUP_FILE"
+log "INFO" "Backup complete [$MODE]: $BACKUP_FILE"
 log "INFO" "  accounts:   $account_count"
 log "INFO" "  categories: $category_count"
 log "INFO" "  budgets:    $budget_count"
 log "INFO" "  labels:     $label_count"
-log "INFO" "  records:    $record_count (date: $BACKUP_DATE)"
+log "INFO" "  records:    $record_count ($DATE_FROM → $DATE_TO)"
 
-send_telegram "Wallet backup OK — ${BACKUP_DATE}: ${record_count} records, ${account_count} accounts, ${budget_count} budgets → $(basename "$BACKUP_FILE")"
+send_telegram "Wallet backup [$MODE] OK — ${record_count} records (${DATE_FROM} → ${DATE_TO}), ${account_count} accounts → $(basename "$BACKUP_FILE")"
+
+# ---------------------------------------------------------------------------
+# Monthly only: remove daily backups whose date_to falls within the same month
+# ---------------------------------------------------------------------------
+if [ "$MODE" = "monthly" ]; then
+    MONTHLY_MONTH="${TARGET_YEAR}-${TARGET_MONTH}"
+    log "INFO" "Cleaning up daily backups for month $MONTHLY_MONTH..."
+    cleaned=0
+
+    DAILY_DIR="$SCRIPT_DIR/backups/daily"
+    if [ -d "$DAILY_DIR" ]; then
+        for f in "$DAILY_DIR"/wallet-daily-*.json; do
+            [ -f "$f" ] || continue
+            file_date_to="$(jq -r '.date_to // empty' "$f" 2>/dev/null)"
+            # Compare YYYY-MM prefix of date_to against the monthly month
+            file_month="$(printf '%s' "$file_date_to" | cut -c1-7)"
+            if [ "$file_month" = "$MONTHLY_MONTH" ]; then
+                log "INFO" "  Removing $f (date_to: $file_date_to)"
+                rm "$f"
+                cleaned=$((cleaned + 1))
+            fi
+        done
+    fi
+
+    log "INFO" "  Removed $cleaned daily backup(s) covered by monthly $MONTHLY_MONTH"
+fi
