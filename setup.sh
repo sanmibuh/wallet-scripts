@@ -115,6 +115,8 @@ TELEGRAM_TOKEN="$TELEGRAM_TOKEN"
 CHAT_ID="$CHAT_ID"
 EOF_CONF
 
+mkdir -p "$SCRIPT_DIR/backups"
+
 chmod +x "$SCRIPT_DIR/bin/"* 2>/dev/null || true
 chmod +x "$SCRIPT_DIR/setup.sh" 2>/dev/null || true
 
