@@ -1,0 +1,95 @@
+#!/bin/sh
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+. "$SCRIPT_DIR/lib/wallet-common.sh"
+
+REPO_URL="https://github.com/sanmibuh/wallet-scripts"
+BRANCH="${1:-main}"
+
+download_latest_version() {
+    log "INFO" "Downloading latest version from GitHub"
+
+    TEMP_DIR=$(mktemp -d)
+    if [ $? -ne 0 ]; then
+        log "ERROR" "Failed to create temporary directory"
+        return 1
+    fi
+
+    TARBALL_URL="${REPO_URL}/archive/refs/heads/${BRANCH}.tar.gz"
+
+    curl -L -f -s -S -o "$TEMP_DIR/repo.tar.gz" "$TARBALL_URL"
+    if [ $? -ne 0 ]; then
+        log "ERROR" "Failed to download repository"
+        rm -rf "$TEMP_DIR"
+        return 1
+    fi
+
+    echo "$TEMP_DIR"
+    return 0
+}
+
+calculate_checksum() {
+    find "$SCRIPT_DIR" -type f \
+        ! -path "*/config/*" \
+        ! -path "*/.git/*" \
+        -exec shasum {} \; 2>/dev/null | sort | shasum | awk '{print $1}'
+}
+
+extract_and_update() {
+    TEMP_DIR="$1"
+
+    tar -xzf "$TEMP_DIR/repo.tar.gz" -C "$TEMP_DIR" || {
+        log "ERROR" "Failed to extract archive"
+        rm -rf "$TEMP_DIR"
+        return 1
+    }
+
+    EXTRACTED_DIR=$(find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+    if [ -z "$EXTRACTED_DIR" ] || [ ! -d "$EXTRACTED_DIR" ]; then
+        log "ERROR" "Could not find extracted directory"
+        rm -rf "$TEMP_DIR"
+        return 1
+    fi
+
+    CHECKSUM_BEFORE=$(calculate_checksum)
+
+    if [ -f "$SCRIPT_DIR/config/wallet.conf" ]; then
+        cp "$SCRIPT_DIR/config/wallet.conf" "$TEMP_DIR/wallet.conf.backup"
+    fi
+
+    cp -R "$EXTRACTED_DIR/"* "$SCRIPT_DIR/"
+
+    if [ -f "$TEMP_DIR/wallet.conf.backup" ]; then
+        mv "$TEMP_DIR/wallet.conf.backup" "$SCRIPT_DIR/config/wallet.conf"
+    fi
+
+    chmod +x "$SCRIPT_DIR/bin/"* 2>/dev/null
+    chmod +x "$SCRIPT_DIR/setup.sh" 2>/dev/null
+
+    CHECKSUM_AFTER=$(calculate_checksum)
+    rm -rf "$TEMP_DIR"
+
+    if [ "$CHECKSUM_BEFORE" = "$CHECKSUM_AFTER" ]; then
+        return 2
+    fi
+
+    return 0
+}
+
+cd "$SCRIPT_DIR" || exit 1
+load_config
+
+TEMP_DIR=$(download_latest_version) || exit 1
+extract_and_update "$TEMP_DIR"
+RESULT=$?
+
+if [ $RESULT -eq 1 ]; then
+    exit 1
+fi
+
+if [ $RESULT -eq 2 ]; then
+    log "INFO" "No changes detected - already up to date"
+else
+    log "INFO" "Update completed successfully"
+    send_telegram "wallet-scripts updated successfully from ${BRANCH}"
+fi

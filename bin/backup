@@ -1,0 +1,23 @@
+#!/bin/sh
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+. "$SCRIPT_DIR/lib/wallet-common.sh"
+
+cd "$SCRIPT_DIR" || exit 1
+load_config
+
+TIMESTAMP="$(date '+%Y%m%d-%H%M%S')"
+BACKUP_DIR="$SCRIPT_DIR/backups"
+BACKUP_FILE="$BACKUP_DIR/wallet-backup-${TIMESTAMP}.txt"
+
+mkdir -p "$BACKUP_DIR"
+
+{
+    echo "wallet-scripts backup (WIP)"
+    echo "generated_at=$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "base_url=$BASE_URL"
+    echo "status=not-implemented"
+} > "$BACKUP_FILE"
+
+log "INFO" "Backup placeholder created: $BACKUP_FILE"
+send_telegram "wallet-scripts backup placeholder created: ${TIMESTAMP}"
