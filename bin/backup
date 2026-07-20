@@ -1,23 +1,181 @@
 #!/bin/sh
 
+# backup - Wallet full backup for a given day
+#
+# Usage: backup [DATE]
+#   DATE  Reference date in YYYY-MM-DD format (default: today).
+#         The script backs up data from the DAY BEFORE this date.
+#
+# The backup is saved to <project>/backups/wallet-backup-<BACKUP_DATE>.json
+
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "$SCRIPT_DIR/lib/wallet-common.sh"
 
 cd "$SCRIPT_DIR" || exit 1
 load_config
 
-TIMESTAMP="$(date '+%Y%m%d-%H%M%S')"
+# ---------------------------------------------------------------------------
+# Check for jq
+# ---------------------------------------------------------------------------
+if ! command -v jq >/dev/null 2>&1; then
+    log "ERROR" "jq is required but not installed. Install it with: brew install jq"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Resolve reference date and compute backup date (day before)
+# ---------------------------------------------------------------------------
+if [ -n "$1" ]; then
+    REF_DATE="$1"
+else
+    REF_DATE="$(date '+%Y-%m-%d')"
+fi
+
+# Compute the day before REF_DATE (portable: macOS + Linux)
+if date --version >/dev/null 2>&1; then
+    # GNU date (Linux)
+    BACKUP_DATE="$(date -d "${REF_DATE} -1 day" '+%Y-%m-%d')"
+else
+    # BSD date (macOS)
+    BACKUP_DATE="$(date -j -v-1d -f '%Y-%m-%d' "${REF_DATE}" '+%Y-%m-%d')"
+fi
+
 BACKUP_DIR="$SCRIPT_DIR/backups"
-BACKUP_FILE="$BACKUP_DIR/wallet-backup-${TIMESTAMP}.txt"
+BACKUP_FILE="$BACKUP_DIR/wallet-backup-${BACKUP_DATE}.json"
 
 mkdir -p "$BACKUP_DIR"
 
-{
-    echo "wallet-scripts backup (WIP)"
-    echo "generated_at=$(date '+%Y-%m-%d %H:%M:%S')"
-    echo "base_url=$BASE_URL"
-    echo "status=not-implemented"
-} > "$BACKUP_FILE"
+# Temp dir cleaned up on exit
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
 
-log "INFO" "Backup placeholder created: $BACKUP_FILE"
-send_telegram "wallet-scripts backup placeholder created: ${TIMESTAMP}"
+log "INFO" "Starting backup for date: $BACKUP_DATE (reference: $REF_DATE)"
+
+# ---------------------------------------------------------------------------
+# fetch_resource <resource> <response_key> <limit> <out_file> [extra_params]
+#
+# Fetches all pages of a resource and writes a single JSON array to <out_file>.
+# Never passes JSON through shell variables to avoid echo/\n corruption.
+#
+# The API wraps items under the resource name:
+#   GET /accounts  → {"accounts": [...], "nextOffset": 50}
+#   GET /records   → {"records": [...], "nextOffset": 200}
+# ---------------------------------------------------------------------------
+fetch_resource() {
+    resource="$1"
+    resp_key="$2"
+    limit="$3"
+    out_file="$4"
+    extra_params="$5"
+
+    offset=0
+    combined_file="$TMP_DIR/${resource}_combined.json"
+    page_file="$TMP_DIR/${resource}_page.json"
+    tmp_file="$TMP_DIR/${resource}_tmp.json"
+
+    printf '[]' > "$combined_file"
+
+    while true; do
+        url="${BASE_URL}/${resource}?limit=${limit}&offset=${offset}${extra_params}"
+        log "INFO" "  GET /${resource} offset=${offset}..."
+
+        curl -sS --max-time 30 \
+            -H "Authorization: Bearer ${API_TOKEN}" \
+            -H "Accept: application/json" \
+            "$url" > "$page_file"
+
+        if [ $? -ne 0 ]; then
+            log "ERROR" "Network error fetching ${resource}"
+            exit 1
+        fi
+
+        # Detect API-level errors
+        api_error="$(jq -r '.error // empty' "$page_file" 2>/dev/null)"
+        if [ -n "$api_error" ]; then
+            api_msg="$(jq -r '.message // empty' "$page_file" 2>/dev/null)"
+            log "ERROR" "API error for ${resource}: $api_error — $api_msg"
+            exit 1
+        fi
+
+        # Merge page items into combined array (all via files, no shell variables)
+        jq -s --arg key "$resp_key" \
+            '.[0] + (.[1][$key] // [])' \
+            "$combined_file" "$page_file" > "$tmp_file" \
+            && mv "$tmp_file" "$combined_file"
+
+        next_offset="$(jq -r '.nextOffset // empty' "$page_file" 2>/dev/null)"
+        if [ -z "$next_offset" ]; then
+            break
+        fi
+        offset="$next_offset"
+    done
+
+    cp "$combined_file" "$out_file"
+}
+
+# ---------------------------------------------------------------------------
+# Fetch all resources into temp files
+# Per-resource page limits (API enforces different maxes per endpoint)
+# ---------------------------------------------------------------------------
+log "INFO" "Fetching accounts..."
+fetch_resource "accounts"   "accounts"   "200" "$TMP_DIR/accounts.json"   ""
+
+log "INFO" "Fetching categories..."
+fetch_resource "categories" "categories" "200" "$TMP_DIR/categories.json" ""
+
+log "INFO" "Fetching budgets..."
+fetch_resource "budgets"    "budgets"    "20"  "$TMP_DIR/budgets.json"    ""
+
+log "INFO" "Fetching labels..."
+fetch_resource "labels"     "labels"     "200" "$TMP_DIR/labels.json"     ""
+
+log "INFO" "Fetching records for $BACKUP_DATE..."
+fetch_resource "records"    "records"    "200" "$TMP_DIR/records.json"    "&recordDate=eq.${BACKUP_DATE}"
+
+# ---------------------------------------------------------------------------
+# Assemble final backup JSON entirely via files (no shell variables for JSON)
+# ---------------------------------------------------------------------------
+log "INFO" "Assembling backup file: $BACKUP_FILE"
+
+jq -n \
+    --arg      backup_date  "$BACKUP_DATE" \
+    --arg      generated_at "$(date '+%Y-%m-%d %H:%M:%S')" \
+    --arg      base_url     "$BASE_URL" \
+    --slurpfile accounts    "$TMP_DIR/accounts.json" \
+    --slurpfile categories  "$TMP_DIR/categories.json" \
+    --slurpfile budgets     "$TMP_DIR/budgets.json" \
+    --slurpfile labels      "$TMP_DIR/labels.json" \
+    --slurpfile records     "$TMP_DIR/records.json" \
+    '{
+        backup_date:  $backup_date,
+        generated_at: $generated_at,
+        base_url:     $base_url,
+        accounts:     $accounts[0],
+        categories:   $categories[0],
+        budgets:      $budgets[0],
+        labels:       $labels[0],
+        records:      $records[0]
+    }' > "$BACKUP_FILE"
+
+if [ $? -ne 0 ]; then
+    log "ERROR" "Failed to assemble backup JSON"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Summary (counts read from temp files, never from shell variables)
+# ---------------------------------------------------------------------------
+account_count="$(jq 'length' "$TMP_DIR/accounts.json")"
+category_count="$(jq 'length' "$TMP_DIR/categories.json")"
+budget_count="$(jq 'length'   "$TMP_DIR/budgets.json")"
+label_count="$(jq 'length'    "$TMP_DIR/labels.json")"
+record_count="$(jq 'length'   "$TMP_DIR/records.json")"
+
+log "INFO" "Backup complete: $BACKUP_FILE"
+log "INFO" "  accounts:   $account_count"
+log "INFO" "  categories: $category_count"
+log "INFO" "  budgets:    $budget_count"
+log "INFO" "  labels:     $label_count"
+log "INFO" "  records:    $record_count (date: $BACKUP_DATE)"
+
+send_telegram "Wallet backup OK — ${BACKUP_DATE}: ${record_count} records, ${account_count} accounts, ${budget_count} budgets → $(basename "$BACKUP_FILE")"

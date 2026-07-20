@@ -3,3 +3,6 @@
 
 # Ignore generated configuration file
 config/wallet.conf
+
+#ignore backups
+backups
