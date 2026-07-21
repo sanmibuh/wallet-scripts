@@ -281,28 +281,87 @@ case "$MODE" in
 esac
 
 # ---------------------------------------------------------------------------
-# Date helpers (portable: macOS BSD date + GNU date)
+# Date helpers — portable across GNU date, BSD date (macOS) and BusyBox (Alpine)
+# Falls back to python3 or node for BusyBox environments.
 # ---------------------------------------------------------------------------
-is_gnu_date() {
-    date --version >/dev/null 2>&1
-}
 
+# date_offset YYYY-MM-DD N → date offset by N days (N can be negative)
 date_offset() {
-    base="$1"; days="$2"
-    if is_gnu_date; then
-        date -d "${base} ${days} days" '+%Y-%m-%d'
-    else
-        date -j -v"${days}d" -f '%Y-%m-%d' "${base}" '+%Y-%m-%d'
+    _base="$1"; _days="$2"
+    # GNU date (Linux coreutils)
+    if date --version >/dev/null 2>&1; then
+        date -d "${_base} ${_days} days" '+%Y-%m-%d'
+        return
     fi
+    # BSD date (macOS) — test with -j to distinguish from BusyBox
+    if date -j -f '%Y-%m-%d' "${_base}" '+%Y-%m-%d' >/dev/null 2>&1; then
+        date -j -v"${_days}d" -f '%Y-%m-%d' "${_base}" '+%Y-%m-%d'
+        return
+    fi
+    # BusyBox / fallback — use python3 or node
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "from datetime import date,timedelta; print((date.fromisoformat('${_base}')+timedelta(days=${_days})).isoformat(),end='')"
+        return
+    fi
+    node -e "var d=new Date('${_base}');d.setDate(d.getDate()+(${_days}));process.stdout.write(d.toISOString().slice(0,10));"
 }
 
+# prev_month_year_month → prints "YYYY MM" for the previous calendar month
 prev_month_year_month() {
-    if is_gnu_date; then
+    # GNU date
+    if date --version >/dev/null 2>&1; then
         printf '%s %s' "$(date -d "$(date '+%Y-%m-01') -1 month" '+%Y')" \
                        "$(date -d "$(date '+%Y-%m-01') -1 month" '+%m')"
-    else
-        printf '%s %s' "$(date -j -v-1m '+%Y')" "$(date -j -v-1m '+%m')"
+        return
     fi
+    # BSD date (macOS)
+    if date -j >/dev/null 2>&1; then
+        printf '%s %s' "$(date -j -v-1m '+%Y')" "$(date -j -v-1m '+%m')"
+        return
+    fi
+    # BusyBox / fallback
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "
+from datetime import date, timedelta
+first = date.today().replace(day=1)
+prev = first - timedelta(days=1)
+print(prev.strftime('%Y %m'), end='')
+"
+        return
+    fi
+    node -e "
+var d=new Date(); d.setDate(1); d.setMonth(d.getMonth()-1);
+process.stdout.write(d.getFullYear()+' '+(('0'+(d.getMonth()+1)).slice(-2)));
+"
+}
+
+# last_day_of_month YYYY MM → prints YYYY-MM-DD for the last day of that month
+last_day_of_month() {
+    _y="$1"; _m="$2"
+    # GNU date
+    if date --version >/dev/null 2>&1; then
+        date -d "${_y}-${_m}-01 +1 month -1 day" '+%Y-%m-%d'
+        return
+    fi
+    # BSD date (macOS)
+    if date -j >/dev/null 2>&1; then
+        date -j -v+1m -v-1d -f '%Y-%m-%d' "${_y}-${_m}-01" '+%Y-%m-%d'
+        return
+    fi
+    # BusyBox / fallback
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "
+import calendar
+from datetime import date
+y, m = ${_y}, int('${_m}')
+print(date(y, m, calendar.monthrange(y, m)[1]).isoformat(), end='')
+"
+        return
+    fi
+    node -e "
+var d=new Date(${_y}, parseInt('${_m}'), 0);
+process.stdout.write(d.getFullYear()+'-'+(('0'+(d.getMonth()+1)).slice(-2))+'-'+(('0'+d.getDate()).slice(-2)));
+"
 }
 
 today="$(date '+%Y-%m-%d')"
@@ -339,11 +398,7 @@ case "$MODE" in
             TARGET_YEAR="$1"; TARGET_MONTH="$2"
         fi
         DATE_FROM="${TARGET_YEAR}-${TARGET_MONTH}-01"
-        if is_gnu_date; then
-            DATE_TO="$(date -d "${TARGET_YEAR}-${TARGET_MONTH}-01 +1 month -1 day" '+%Y-%m-%d')"
-        else
-            DATE_TO="$(date -j -v+1m -v-1d -f '%Y-%m-%d' "${TARGET_YEAR}-${TARGET_MONTH}-01" '+%Y-%m-%d')"
-        fi
+        DATE_TO="$(last_day_of_month "$TARGET_YEAR" "$TARGET_MONTH")"
         BACKUP_SUBDIR="$SCRIPT_DIR/backups/monthly"
         BACKUP_FILE="$BACKUP_SUBDIR/wallet-monthly-${TARGET_YEAR}-${TARGET_MONTH}.json"
         RANGE_DESC="month ${TARGET_YEAR}-${TARGET_MONTH} ($DATE_FROM → $DATE_TO)"
