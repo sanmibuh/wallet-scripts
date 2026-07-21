@@ -20,6 +20,8 @@
 # Cleanup:
 #   monthly  automatically removes daily backups whose date_to is in that month
 #   yearly   automatically removes monthly backups whose month is in that year
+#
+# Requires: curl + one of: jq, python3, node
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "$SCRIPT_DIR/lib/wallet-common.sh"
@@ -63,6 +65,8 @@ Recommended crontab:
   0 3   15 * *   /path/to/bin/backup monthly  >> /tmp/wallet-backup.log 2>&1
   0 4    1 1 *   /path/to/bin/backup yearly   >> /tmp/wallet-backup.log 2>&1
 
+Requires: curl + one of jq, python3, node
+
 EOF
 }
 
@@ -72,14 +76,194 @@ if [ -z "$1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Check for jq
+# Detect JSON processor: jq > python3 > node
 # ---------------------------------------------------------------------------
-if ! command -v jq >/dev/null 2>&1; then
-    log "ERROR" "jq is required but not installed. Install it with: brew install jq"
+if command -v jq >/dev/null 2>&1; then
+    JSON_PROC="jq"
+elif command -v python3 >/dev/null 2>&1; then
+    JSON_PROC="python3"
+elif command -v node >/dev/null 2>&1; then
+    JSON_PROC="node"
+else
+    log "ERROR" "No JSON processor found. Install one of: jq, python3, node"
+    log "ERROR" "  macOS:  brew install jq"
+    log "ERROR" "  Debian: apt-get install -y jq"
+    log "ERROR" "  Alpine: apk add jq"
     exit 1
 fi
 
+log "INFO" "Using JSON processor: $JSON_PROC"
+
 load_config
+
+# ---------------------------------------------------------------------------
+# JSON helper functions (dispatch to detected processor)
+# All operate on files — never pass JSON through shell variables.
+# ---------------------------------------------------------------------------
+
+# json_get_field <file> <field>
+# Prints the string value of a top-level field, or empty string if absent.
+json_get_field() {
+    _jgf_file="$1"
+    _jgf_field="$2"
+    case "$JSON_PROC" in
+        jq)
+            jq -r --arg k "$_jgf_field" '.[$k] // empty' "$_jgf_file" 2>/dev/null
+            ;;
+        python3)
+            python3 - "$_jgf_file" "$_jgf_field" 2>/dev/null <<'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    v = d.get(sys.argv[2])
+    print('' if v is None else str(v), end='')
+except Exception:
+    pass
+PYEOF
+            ;;
+        node)
+            node -e "
+try {
+  var d=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'));
+  var v=d[process.argv[2]];
+  process.stdout.write(v!=null?String(v):'');
+} catch(e) {}
+" "$_jgf_file" "$_jgf_field" 2>/dev/null
+            ;;
+    esac
+}
+
+# json_merge_arrays <combined_file> <page_file> <key> <out_file>
+# Appends page_file[key] array into combined_file array → out_file.
+json_merge_arrays() {
+    _jma_combined="$1"
+    _jma_page="$2"
+    _jma_key="$3"
+    _jma_out="$4"
+    case "$JSON_PROC" in
+        jq)
+            jq -s --arg k "$_jma_key" '.[0] + (.[1][$k] // [])' \
+                "$_jma_combined" "$_jma_page" > "$_jma_out"
+            ;;
+        python3)
+            python3 - "$_jma_combined" "$_jma_page" "$_jma_key" "$_jma_out" 2>/dev/null <<'PYEOF'
+import json, sys
+a = json.load(open(sys.argv[1]))
+b = json.load(open(sys.argv[2]))
+with open(sys.argv[4], 'w') as f:
+    json.dump(a + b.get(sys.argv[3], []), f, ensure_ascii=False)
+PYEOF
+            ;;
+        node)
+            node -e "
+var fs=require('fs');
+var a=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));
+var b=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
+var key=process.argv[3];
+fs.writeFileSync(process.argv[4], JSON.stringify(a.concat(b[key]||[])));
+" "$_jma_combined" "$_jma_page" "$_jma_key" "$_jma_out" 2>/dev/null
+            ;;
+    esac
+}
+
+# json_array_length <file>
+# Prints the number of elements in a JSON array file.
+json_array_length() {
+    _jal_file="$1"
+    case "$JSON_PROC" in
+        jq)
+            jq 'length' "$_jal_file"
+            ;;
+        python3)
+            python3 - "$_jal_file" 2>/dev/null <<'PYEOF'
+import json, sys
+print(len(json.load(open(sys.argv[1]))))
+PYEOF
+            ;;
+        node)
+            node -e "
+process.stdout.write(String(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).length));
+" "$_jal_file" 2>/dev/null
+            ;;
+    esac
+}
+
+# json_build_backup <out_file> <mode> <date_from> <date_to> <generated_at> <base_url>
+#                   <accounts_file> <categories_file> <budgets_file> <labels_file> <records_file>
+json_build_backup() {
+    _jbb_out="$1"
+    _jbb_mode="$2"
+    _jbb_from="$3"
+    _jbb_to="$4"
+    _jbb_at="$5"
+    _jbb_url="$6"
+    _jbb_accounts="$7"
+    _jbb_categories="$8"
+    _jbb_budgets="$9"
+    # sh doesn't expand ${10}+ in all implementations; use shift
+    shift 9
+    _jbb_labels="$1"
+    _jbb_records="$2"
+
+    case "$JSON_PROC" in
+        jq)
+            jq -n \
+                --arg mode         "$_jbb_mode" \
+                --arg date_from    "$_jbb_from" \
+                --arg date_to      "$_jbb_to" \
+                --arg generated_at "$_jbb_at" \
+                --arg base_url     "$_jbb_url" \
+                --slurpfile accounts    "$_jbb_accounts" \
+                --slurpfile categories  "$_jbb_categories" \
+                --slurpfile budgets     "$_jbb_budgets" \
+                --slurpfile labels      "$_jbb_labels" \
+                --slurpfile records     "$_jbb_records" \
+                '{mode:$mode,date_from:$date_from,date_to:$date_to,generated_at:$generated_at,base_url:$base_url,accounts:$accounts[0],categories:$categories[0],budgets:$budgets[0],labels:$labels[0],records:$records[0]}' \
+                > "$_jbb_out"
+            ;;
+        python3)
+            python3 - \
+                "$_jbb_out" "$_jbb_mode" "$_jbb_from" "$_jbb_to" "$_jbb_at" "$_jbb_url" \
+                "$_jbb_accounts" "$_jbb_categories" "$_jbb_budgets" "$_jbb_labels" "$_jbb_records" \
+                2>/dev/null <<'PYEOF'
+import json, sys
+out_file, mode, date_from, date_to, generated_at, base_url, \
+    f_accounts, f_categories, f_budgets, f_labels, f_records = sys.argv[1:]
+out = {
+    'mode':         mode,
+    'date_from':    date_from,
+    'date_to':      date_to,
+    'generated_at': generated_at,
+    'base_url':     base_url,
+    'accounts':     json.load(open(f_accounts)),
+    'categories':   json.load(open(f_categories)),
+    'budgets':      json.load(open(f_budgets)),
+    'labels':       json.load(open(f_labels)),
+    'records':      json.load(open(f_records)),
+}
+with open(out_file, 'w') as f:
+    json.dump(out, f, indent=2, ensure_ascii=False)
+PYEOF
+            ;;
+        node)
+            node -e "
+var fs=require('fs'), args=process.argv.slice(1);
+var out={
+  mode:args[1], date_from:args[2], date_to:args[3],
+  generated_at:args[4], base_url:args[5],
+  accounts:   JSON.parse(fs.readFileSync(args[6],'utf8')),
+  categories: JSON.parse(fs.readFileSync(args[7],'utf8')),
+  budgets:    JSON.parse(fs.readFileSync(args[8],'utf8')),
+  labels:     JSON.parse(fs.readFileSync(args[9],'utf8')),
+  records:    JSON.parse(fs.readFileSync(args[10],'utf8')),
+};
+fs.writeFileSync(args[0], JSON.stringify(out,null,2));
+" "$_jbb_out" "$_jbb_mode" "$_jbb_from" "$_jbb_to" "$_jbb_at" "$_jbb_url" \
+  "$_jbb_accounts" "$_jbb_categories" "$_jbb_budgets" "$_jbb_labels" "$_jbb_records" \
+  2>/dev/null
+            ;;
+    esac
+}
 
 # ---------------------------------------------------------------------------
 # Parse arguments
@@ -104,7 +288,6 @@ is_gnu_date() {
 }
 
 date_offset() {
-    # date_offset YYYY-MM-DD N  → date offset by N days (N can be negative)
     base="$1"; days="$2"
     if is_gnu_date; then
         date -d "${base} ${days} days" '+%Y-%m-%d'
@@ -114,7 +297,6 @@ date_offset() {
 }
 
 prev_month_year_month() {
-    # Returns "YYYY MM" for the month before today
     if is_gnu_date; then
         printf '%s %s' "$(date -d "$(date '+%Y-%m-01') -1 month" '+%Y')" \
                        "$(date -d "$(date '+%Y-%m-01') -1 month" '+%m')"
@@ -133,11 +315,7 @@ current_month="$(date '+%m')"
 case "$MODE" in
 
     daily)
-        if [ -n "$PARAM" ]; then
-            REF_DATE="$PARAM"
-        else
-            REF_DATE="$today"
-        fi
+        REF_DATE="${PARAM:-$today}"
         DATE_TO="$(date_offset "$REF_DATE" -1)"
         DATE_FROM="$(date_offset "$REF_DATE" -7)"
         BACKUP_SUBDIR="$SCRIPT_DIR/backups/daily"
@@ -147,7 +325,6 @@ case "$MODE" in
 
     monthly)
         if [ -n "$PARAM" ]; then
-            # Validate YYYY-MM format
             case "$PARAM" in
                 [0-9][0-9][0-9][0-9]-[0-9][0-9]) ;;
                 *)
@@ -162,7 +339,6 @@ case "$MODE" in
             TARGET_YEAR="$1"; TARGET_MONTH="$2"
         fi
         DATE_FROM="${TARGET_YEAR}-${TARGET_MONTH}-01"
-        # Last day = first day of next month minus 1
         if is_gnu_date; then
             DATE_TO="$(date -d "${TARGET_YEAR}-${TARGET_MONTH}-01 +1 month -1 day" '+%Y-%m-%d')"
         else
@@ -196,7 +372,6 @@ esac
 
 mkdir -p "$BACKUP_SUBDIR"
 
-# Temp dir cleaned up on exit
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -204,9 +379,6 @@ log "INFO" "Starting $MODE backup — $RANGE_DESC"
 
 # ---------------------------------------------------------------------------
 # fetch_resource <resource> <response_key> <limit> <out_file> [extra_params]
-#
-# Fetches all pages and writes a single JSON array to <out_file>.
-# All JSON is handled via files to avoid shell echo/\n corruption.
 # ---------------------------------------------------------------------------
 fetch_resource() {
     resource="$1"
@@ -236,19 +408,17 @@ fetch_resource() {
             exit 1
         fi
 
-        api_error="$(jq -r '.error // empty' "$page_file" 2>/dev/null)"
+        api_error="$(json_get_field "$page_file" "error")"
         if [ -n "$api_error" ]; then
-            api_msg="$(jq -r '.message // empty' "$page_file" 2>/dev/null)"
+            api_msg="$(json_get_field "$page_file" "message")"
             log "ERROR" "API error for ${resource}: $api_error — $api_msg"
             exit 1
         fi
 
-        jq -s --arg key "$resp_key" \
-            '.[0] + (.[1][$key] // [])' \
-            "$combined_file" "$page_file" > "$tmp_file" \
+        json_merge_arrays "$combined_file" "$page_file" "$resp_key" "$tmp_file" \
             && mv "$tmp_file" "$combined_file"
 
-        next_offset="$(jq -r '.nextOffset // empty' "$page_file" 2>/dev/null)"
+        next_offset="$(json_get_field "$page_file" "nextOffset")"
         if [ -z "$next_offset" ]; then
             break
         fi
@@ -259,7 +429,7 @@ fetch_resource() {
 }
 
 # ---------------------------------------------------------------------------
-# Fetch static resources (current snapshot)
+# Fetch all resources
 # ---------------------------------------------------------------------------
 log "INFO" "Fetching accounts..."
 fetch_resource "accounts"   "accounts"   "200" "$TMP_DIR/accounts.json"   ""
@@ -273,9 +443,6 @@ fetch_resource "budgets"    "budgets"    "20"  "$TMP_DIR/budgets.json"    ""
 log "INFO" "Fetching labels..."
 fetch_resource "labels"     "labels"     "200" "$TMP_DIR/labels.json"     ""
 
-# ---------------------------------------------------------------------------
-# Fetch records for the resolved date range
-# ---------------------------------------------------------------------------
 log "INFO" "Fetching records ($DATE_FROM → $DATE_TO)..."
 fetch_resource "records" "records" "200" "$TMP_DIR/records.json" \
     "&recordDate=gte.${DATE_FROM}&recordDate=lte.${DATE_TO}"
@@ -285,29 +452,11 @@ fetch_resource "records" "records" "200" "$TMP_DIR/records.json" \
 # ---------------------------------------------------------------------------
 log "INFO" "Assembling backup file: $BACKUP_FILE"
 
-jq -n \
-    --arg      mode         "$MODE" \
-    --arg      date_from    "$DATE_FROM" \
-    --arg      date_to      "$DATE_TO" \
-    --arg      generated_at "$(date '+%Y-%m-%d %H:%M:%S')" \
-    --arg      base_url     "$BASE_URL" \
-    --slurpfile accounts    "$TMP_DIR/accounts.json" \
-    --slurpfile categories  "$TMP_DIR/categories.json" \
-    --slurpfile budgets     "$TMP_DIR/budgets.json" \
-    --slurpfile labels      "$TMP_DIR/labels.json" \
-    --slurpfile records     "$TMP_DIR/records.json" \
-    '{
-        mode:         $mode,
-        date_from:    $date_from,
-        date_to:      $date_to,
-        generated_at: $generated_at,
-        base_url:     $base_url,
-        accounts:     $accounts[0],
-        categories:   $categories[0],
-        budgets:      $budgets[0],
-        labels:       $labels[0],
-        records:      $records[0]
-    }' > "$BACKUP_FILE"
+json_build_backup \
+    "$BACKUP_FILE" "$MODE" "$DATE_FROM" "$DATE_TO" \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "$BASE_URL" \
+    "$TMP_DIR/accounts.json" "$TMP_DIR/categories.json" "$TMP_DIR/budgets.json" \
+    "$TMP_DIR/labels.json" "$TMP_DIR/records.json"
 
 if [ $? -ne 0 ]; then
     log "ERROR" "Failed to assemble backup JSON"
@@ -317,11 +466,11 @@ fi
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
-account_count="$(jq 'length' "$TMP_DIR/accounts.json")"
-category_count="$(jq 'length' "$TMP_DIR/categories.json")"
-budget_count="$(jq 'length'   "$TMP_DIR/budgets.json")"
-label_count="$(jq 'length'    "$TMP_DIR/labels.json")"
-record_count="$(jq 'length'   "$TMP_DIR/records.json")"
+account_count="$(json_array_length "$TMP_DIR/accounts.json")"
+category_count="$(json_array_length "$TMP_DIR/categories.json")"
+budget_count="$(json_array_length   "$TMP_DIR/budgets.json")"
+label_count="$(json_array_length    "$TMP_DIR/labels.json")"
+record_count="$(json_array_length   "$TMP_DIR/records.json")"
 
 log "INFO" "Backup complete [$MODE]: $BACKUP_FILE"
 log "INFO" "  accounts:   $account_count"
@@ -333,21 +482,20 @@ log "INFO" "  records:    $record_count ($DATE_FROM → $DATE_TO)"
 send_telegram "Wallet backup [$MODE] OK — ${record_count} records (${DATE_FROM} → ${DATE_TO}), ${account_count} accounts → $(basename "$BACKUP_FILE")"
 
 # ---------------------------------------------------------------------------
-# Cleanup: monthly removes covered daily backups
-#          yearly  removes covered monthly backups
+# Cleanup: monthly removes covered daily; yearly removes covered monthly
 # ---------------------------------------------------------------------------
 cleanup_covered_backups() {
-    target_dir="$1"    # directory to scan
-    pattern="$2"       # glob pattern, e.g. "wallet-daily-*.json"
-    match_prefix="$3"  # YYYY-MM or YYYY to match against date_to
-    prefix_len="$4"    # 7 for YYYY-MM, 4 for YYYY
+    target_dir="$1"
+    pattern="$2"
+    match_prefix="$3"
+    prefix_len="$4"
     label="$5"
 
     cleaned=0
     if [ -d "$target_dir" ]; then
         for f in "$target_dir"/$pattern; do
             [ -f "$f" ] || continue
-            file_date_to="$(jq -r '.date_to // empty' "$f" 2>/dev/null)"
+            file_date_to="$(json_get_field "$f" "date_to")"
             file_prefix="$(printf '%s' "$file_date_to" | cut -c1-"$prefix_len")"
             if [ "$file_prefix" = "$match_prefix" ]; then
                 log "INFO" "  Removing $label: $(basename "$f") (date_to: $file_date_to)"
