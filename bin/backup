@@ -3,18 +3,73 @@
 # backup - Wallet backup script
 #
 # Usage:
-#   backup [daily]    — backs up the last 7 days (default)
-#   backup monthly    — backs up the full previous calendar month
+#   backup daily   [YYYY-MM-DD]  — 7-day window ending on the day before DATE
+#   backup monthly [YYYY-MM]     — full calendar month
+#   backup yearly  [YYYY]        — full calendar year
+#
+# Defaults (when no parameter is given to a mode):
+#   daily    → reference date = today        → covers last 7 days
+#   monthly  → previous calendar month
+#   yearly   → previous calendar year
 #
 # Backup files:
-#   backups/daily/wallet-daily-YYYY-MM-DD.json     (overwritten each run)
-#   backups/monthly/wallet-monthly-YYYY-MM.json    (permanent)
+#   backups/daily/wallet-daily-YYYY-MM-DD.json      (overwritten each run)
+#   backups/monthly/wallet-monthly-YYYY-MM.json     (permanent)
+#   backups/yearly/wallet-yearly-YYYY.json          (permanent)
+#
+# Cleanup:
+#   monthly  automatically removes daily backups whose date_to is in that month
+#   yearly   automatically removes monthly backups whose month is in that year
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "$SCRIPT_DIR/lib/wallet-common.sh"
 
 cd "$SCRIPT_DIR" || exit 1
-load_config
+
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+print_help() {
+    cat >&2 <<EOF
+
+Usage: backup <mode> [parameter]
+
+Modes:
+  daily   [YYYY-MM-DD]   Back up the 7-day window ending on the day before DATE.
+                         Default: today as reference date.
+                         Output: backups/daily/wallet-daily-YYYY-MM-DD.json
+                                 (overwritten on each run)
+
+  monthly [YYYY-MM]      Back up a full calendar month.
+                         Default: previous calendar month.
+                         Output: backups/monthly/wallet-monthly-YYYY-MM.json
+                                 (permanent; also cleans up daily backups for that month)
+
+  yearly  [YYYY]         Back up a full calendar year.
+                         Default: previous calendar year.
+                         Output: backups/yearly/wallet-yearly-YYYY.json
+                                 (permanent; also cleans up monthly backups for that year)
+
+Examples:
+  backup daily                  # last 7 days (yesterday as end date)
+  backup daily 2026-07-15       # 7 days ending 2026-07-14
+  backup monthly                # previous calendar month
+  backup monthly 2026-06        # June 2026
+  backup yearly                 # previous calendar year
+  backup yearly 2025            # full year 2025
+
+Recommended crontab:
+  0 2    * * *   /path/to/bin/backup daily    >> /tmp/wallet-backup.log 2>&1
+  0 3   15 * *   /path/to/bin/backup monthly  >> /tmp/wallet-backup.log 2>&1
+  0 4    1 1 *   /path/to/bin/backup yearly   >> /tmp/wallet-backup.log 2>&1
+
+EOF
+}
+
+if [ -z "$1" ]; then
+    print_help
+    exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Check for jq
@@ -24,27 +79,47 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 1
 fi
 
-# ---------------------------------------------------------------------------
-# Parse mode argument
-# ---------------------------------------------------------------------------
-MODE="${1:-daily}"
+load_config
 
-if [ "$MODE" != "daily" ] && [ "$MODE" != "monthly" ]; then
-    log "ERROR" "Unknown mode: '$MODE'. Use 'daily' or 'monthly'."
-    exit 1
-fi
+# ---------------------------------------------------------------------------
+# Parse arguments
+# ---------------------------------------------------------------------------
+MODE="$1"
+PARAM="$2"
+
+case "$MODE" in
+    daily|monthly|yearly) ;;
+    *)
+        log "ERROR" "Unknown mode: '$MODE'."
+        print_help
+        exit 1
+        ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Date helpers (portable: macOS BSD date + GNU date)
 # ---------------------------------------------------------------------------
+is_gnu_date() {
+    date --version >/dev/null 2>&1
+}
+
 date_offset() {
-    # date_offset YYYY-MM-DD N  → date N days from that date (N can be negative)
-    base="$1"
-    days="$2"
-    if date --version >/dev/null 2>&1; then
+    # date_offset YYYY-MM-DD N  → date offset by N days (N can be negative)
+    base="$1"; days="$2"
+    if is_gnu_date; then
         date -d "${base} ${days} days" '+%Y-%m-%d'
     else
         date -j -v"${days}d" -f '%Y-%m-%d' "${base}" '+%Y-%m-%d'
+    fi
+}
+
+prev_month_year_month() {
+    # Returns "YYYY MM" for the month before today
+    if is_gnu_date; then
+        printf '%s %s' "$(date -d "$(date '+%Y-%m-01') -1 month" '+%Y')" \
+                       "$(date -d "$(date '+%Y-%m-01') -1 month" '+%m')"
+    else
+        printf '%s %s' "$(date -j -v-1m '+%Y')" "$(date -j -v-1m '+%m')"
     fi
 }
 
@@ -53,38 +128,71 @@ current_year="$(date '+%Y')"
 current_month="$(date '+%m')"
 
 # ---------------------------------------------------------------------------
-# Resolve date range and output paths based on mode
+# Resolve date range and output paths per mode
 # ---------------------------------------------------------------------------
-if [ "$MODE" = "daily" ]; then
-    # Last 7 days (from 7 days ago up to and including yesterday)
-    DATE_FROM="$(date_offset "$today" -7)"
-    DATE_TO="$(date_offset "$today" -1)"
-    BACKUP_SUBDIR="$SCRIPT_DIR/backups/daily"
-    BACKUP_FILE="$BACKUP_SUBDIR/wallet-daily-${today}.json"
-    RANGE_DESC="last 7 days ($DATE_FROM → $DATE_TO)"
+case "$MODE" in
 
-else
-    # Full previous calendar month
-    # Subtract one month to get the target month
-    if date --version >/dev/null 2>&1; then
-        # GNU date
-        TARGET_YEAR="$(date -d "${today} -1 month" '+%Y')"
-        TARGET_MONTH="$(date -d "${today} -1 month" '+%m')"
-    else
-        # BSD date: go back 1 month
-        TARGET_YEAR="$(date -j -v-1m -f '%Y-%m-%d' "${today}" '+%Y')"
-        TARGET_MONTH="$(date -j -v-1m -f '%Y-%m-%d' "${today}" '+%m')"
-    fi
+    daily)
+        if [ -n "$PARAM" ]; then
+            REF_DATE="$PARAM"
+        else
+            REF_DATE="$today"
+        fi
+        DATE_TO="$(date_offset "$REF_DATE" -1)"
+        DATE_FROM="$(date_offset "$REF_DATE" -7)"
+        BACKUP_SUBDIR="$SCRIPT_DIR/backups/daily"
+        BACKUP_FILE="$BACKUP_SUBDIR/wallet-daily-${REF_DATE}.json"
+        RANGE_DESC="7-day window ($DATE_FROM → $DATE_TO)"
+        ;;
 
-    DATE_FROM="${TARGET_YEAR}-${TARGET_MONTH}-01"
-    # First day of current month minus 1 day = last day of target month
-    FIRST_CURRENT="${current_year}-${current_month}-01"
-    DATE_TO="$(date_offset "$FIRST_CURRENT" -1)"
+    monthly)
+        if [ -n "$PARAM" ]; then
+            # Validate YYYY-MM format
+            case "$PARAM" in
+                [0-9][0-9][0-9][0-9]-[0-9][0-9]) ;;
+                *)
+                    log "ERROR" "Invalid month format: '$PARAM'. Expected YYYY-MM."
+                    exit 1
+                    ;;
+            esac
+            TARGET_YEAR="${PARAM%-*}"
+            TARGET_MONTH="${PARAM#*-}"
+        else
+            set -- $(prev_month_year_month)
+            TARGET_YEAR="$1"; TARGET_MONTH="$2"
+        fi
+        DATE_FROM="${TARGET_YEAR}-${TARGET_MONTH}-01"
+        # Last day = first day of next month minus 1
+        if is_gnu_date; then
+            DATE_TO="$(date -d "${TARGET_YEAR}-${TARGET_MONTH}-01 +1 month -1 day" '+%Y-%m-%d')"
+        else
+            DATE_TO="$(date -j -v+1m -v-1d -f '%Y-%m-%d' "${TARGET_YEAR}-${TARGET_MONTH}-01" '+%Y-%m-%d')"
+        fi
+        BACKUP_SUBDIR="$SCRIPT_DIR/backups/monthly"
+        BACKUP_FILE="$BACKUP_SUBDIR/wallet-monthly-${TARGET_YEAR}-${TARGET_MONTH}.json"
+        RANGE_DESC="month ${TARGET_YEAR}-${TARGET_MONTH} ($DATE_FROM → $DATE_TO)"
+        ;;
 
-    BACKUP_SUBDIR="$SCRIPT_DIR/backups/monthly"
-    BACKUP_FILE="$BACKUP_SUBDIR/wallet-monthly-${TARGET_YEAR}-${TARGET_MONTH}.json"
-    RANGE_DESC="month ${TARGET_YEAR}-${TARGET_MONTH} ($DATE_FROM → $DATE_TO)"
-fi
+    yearly)
+        if [ -n "$PARAM" ]; then
+            case "$PARAM" in
+                [0-9][0-9][0-9][0-9]) ;;
+                *)
+                    log "ERROR" "Invalid year format: '$PARAM'. Expected YYYY."
+                    exit 1
+                    ;;
+            esac
+            TARGET_YEAR="$PARAM"
+        else
+            TARGET_YEAR="$((current_year - 1))"
+        fi
+        DATE_FROM="${TARGET_YEAR}-01-01"
+        DATE_TO="${TARGET_YEAR}-12-31"
+        BACKUP_SUBDIR="$SCRIPT_DIR/backups/yearly"
+        BACKUP_FILE="$BACKUP_SUBDIR/wallet-yearly-${TARGET_YEAR}.json"
+        RANGE_DESC="year ${TARGET_YEAR} ($DATE_FROM → $DATE_TO)"
+        ;;
+esac
 
 mkdir -p "$BACKUP_SUBDIR"
 
@@ -151,7 +259,7 @@ fetch_resource() {
 }
 
 # ---------------------------------------------------------------------------
-# Fetch static resources (current snapshot — same for both modes)
+# Fetch static resources (current snapshot)
 # ---------------------------------------------------------------------------
 log "INFO" "Fetching accounts..."
 fetch_resource "accounts"   "accounts"   "200" "$TMP_DIR/accounts.json"   ""
@@ -166,7 +274,7 @@ log "INFO" "Fetching labels..."
 fetch_resource "labels"     "labels"     "200" "$TMP_DIR/labels.json"     ""
 
 # ---------------------------------------------------------------------------
-# Fetch records for the date range
+# Fetch records for the resolved date range
 # ---------------------------------------------------------------------------
 log "INFO" "Fetching records ($DATE_FROM → $DATE_TO)..."
 fetch_resource "records" "records" "200" "$TMP_DIR/records.json" \
@@ -225,27 +333,43 @@ log "INFO" "  records:    $record_count ($DATE_FROM → $DATE_TO)"
 send_telegram "Wallet backup [$MODE] OK — ${record_count} records (${DATE_FROM} → ${DATE_TO}), ${account_count} accounts → $(basename "$BACKUP_FILE")"
 
 # ---------------------------------------------------------------------------
-# Monthly only: remove daily backups whose date_to falls within the same month
+# Cleanup: monthly removes covered daily backups
+#          yearly  removes covered monthly backups
 # ---------------------------------------------------------------------------
-if [ "$MODE" = "monthly" ]; then
-    MONTHLY_MONTH="${TARGET_YEAR}-${TARGET_MONTH}"
-    log "INFO" "Cleaning up daily backups for month $MONTHLY_MONTH..."
-    cleaned=0
+cleanup_covered_backups() {
+    target_dir="$1"    # directory to scan
+    pattern="$2"       # glob pattern, e.g. "wallet-daily-*.json"
+    match_prefix="$3"  # YYYY-MM or YYYY to match against date_to
+    prefix_len="$4"    # 7 for YYYY-MM, 4 for YYYY
+    label="$5"
 
-    DAILY_DIR="$SCRIPT_DIR/backups/daily"
-    if [ -d "$DAILY_DIR" ]; then
-        for f in "$DAILY_DIR"/wallet-daily-*.json; do
+    cleaned=0
+    if [ -d "$target_dir" ]; then
+        for f in "$target_dir"/$pattern; do
             [ -f "$f" ] || continue
             file_date_to="$(jq -r '.date_to // empty' "$f" 2>/dev/null)"
-            # Compare YYYY-MM prefix of date_to against the monthly month
-            file_month="$(printf '%s' "$file_date_to" | cut -c1-7)"
-            if [ "$file_month" = "$MONTHLY_MONTH" ]; then
-                log "INFO" "  Removing $f (date_to: $file_date_to)"
+            file_prefix="$(printf '%s' "$file_date_to" | cut -c1-"$prefix_len")"
+            if [ "$file_prefix" = "$match_prefix" ]; then
+                log "INFO" "  Removing $label: $(basename "$f") (date_to: $file_date_to)"
                 rm "$f"
                 cleaned=$((cleaned + 1))
             fi
         done
     fi
+    log "INFO" "  Removed $cleaned $label file(s) covered by $MODE $match_prefix"
+}
 
-    log "INFO" "  Removed $cleaned daily backup(s) covered by monthly $MONTHLY_MONTH"
+if [ "$MODE" = "monthly" ]; then
+    MONTHLY_MONTH="${TARGET_YEAR}-${TARGET_MONTH}"
+    log "INFO" "Cleaning up daily backups for month $MONTHLY_MONTH..."
+    cleanup_covered_backups \
+        "$SCRIPT_DIR/backups/daily" "wallet-daily-*.json" \
+        "$MONTHLY_MONTH" 7 "daily"
+fi
+
+if [ "$MODE" = "yearly" ]; then
+    log "INFO" "Cleaning up monthly backups for year $TARGET_YEAR..."
+    cleanup_covered_backups \
+        "$SCRIPT_DIR/backups/monthly" "wallet-monthly-*.json" \
+        "$TARGET_YEAR" 4 "monthly"
 fi
