@@ -29,10 +29,19 @@ download_latest_version() {
 }
 
 calculate_checksum() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        _sha_cmd="sha256sum"
+    elif command -v shasum >/dev/null 2>&1; then
+        _sha_cmd="shasum"
+    else
+        # No checksum tool available — return a timestamp so updates always apply
+        date '+%s'
+        return
+    fi
     find "$SCRIPT_DIR" -type f \
         ! -path "*/config/*" \
         ! -path "*/.git/*" \
-        -exec shasum {} \; 2>/dev/null | sort | shasum | awk '{print $1}'
+        -exec "$_sha_cmd" {} \; 2>/dev/null | sort | "$_sha_cmd" | awk '{print $1}'
 }
 
 extract_and_update() {
