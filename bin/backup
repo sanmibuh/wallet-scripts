@@ -3,22 +3,20 @@
 # backup - Wallet backup script
 #
 # Usage:
-#   backup daily   [YYYY-MM-DD]  — 7-day window ending on the day before DATE
-#   backup monthly [YYYY-MM]     — full calendar month
-#   backup yearly  [YYYY]        — full calendar year
+#   backup recent              — previous month + current month (recommended for cron)
+#   backup monthly [YYYY-MM]   — full calendar month
+#   backup yearly  [YYYY]      — full calendar year
 #
 # Defaults (when no parameter is given to a mode):
-#   daily    → reference date = today        → covers last 7 days
+#   recent   → previous month + current month
 #   monthly  → previous calendar month
 #   yearly   → previous calendar year
 #
 # Backup files:
-#   backups/daily/wallet-daily-YYYY-MM-DD.json      (overwritten each run)
 #   backups/monthly/wallet-monthly-YYYY-MM.json     (permanent)
 #   backups/yearly/wallet-yearly-YYYY.json          (permanent)
 #
 # Cleanup:
-#   monthly  automatically removes daily backups whose date_to is in that month
 #   yearly   automatically removes monthly backups whose month is in that year
 #
 # Requires: curl + one of: jq, python3, node
@@ -37,32 +35,28 @@ print_help() {
 Usage: backup <mode> [parameter]
 
 Modes:
-  daily   [YYYY-MM-DD]   Back up the 7-day window ending on the day before DATE.
-                         Default: today as reference date.
-                         Output: backups/daily/wallet-daily-YYYY-MM-DD.json
-                                 (overwritten on each run)
+  recent             Back up the previous calendar month and the current month.
+                     Recommended for regular cron usage.
 
-  monthly [YYYY-MM]      Back up a full calendar month.
-                         Default: previous calendar month.
-                         Output: backups/monthly/wallet-monthly-YYYY-MM.json
-                                 (permanent; also cleans up daily backups for that month)
+  monthly [YYYY-MM]  Back up a full calendar month.
+                     Default: previous calendar month.
+                     Output: backups/monthly/wallet-monthly-YYYY-MM.json
+                             (permanent)
 
-  yearly  [YYYY]         Back up a full calendar year.
-                         Default: previous calendar year.
-                         Output: backups/yearly/wallet-yearly-YYYY.json
-                                 (permanent; also cleans up monthly backups for that year)
+  yearly  [YYYY]     Back up a full calendar year.
+                     Default: previous calendar year.
+                     Output: backups/yearly/wallet-yearly-YYYY.json
+                             (permanent; also cleans up monthly backups for that year)
 
 Examples:
-  backup daily                  # last 7 days (yesterday as end date)
-  backup daily 2026-07-15       # 7 days ending 2026-07-14
+  backup recent                 # previous month + current month
   backup monthly                # previous calendar month
   backup monthly 2026-06        # June 2026
   backup yearly                 # previous calendar year
   backup yearly 2025            # full year 2025
 
 Recommended crontab:
-  0 2    * * *   /path/to/bin/backup daily    >> /tmp/wallet-backup.log 2>&1
-  0 3   15 * *   /path/to/bin/backup monthly  >> /tmp/wallet-backup.log 2>&1
+  0 2    * * *   /path/to/bin/backup recent   >> /tmp/wallet-backup.log 2>&1
   0 4    1 1 *   /path/to/bin/backup yearly   >> /tmp/wallet-backup.log 2>&1
 
 Requires: curl + one of jq, python3, node
@@ -272,7 +266,7 @@ MODE="$1"
 PARAM="$2"
 
 case "$MODE" in
-    daily|monthly|yearly) ;;
+    recent|monthly|yearly) ;;
     *)
         log "ERROR" "Unknown mode: '$MODE'."
         print_help
@@ -281,30 +275,19 @@ case "$MODE" in
 esac
 
 # ---------------------------------------------------------------------------
+# recent: re-invoke for previous month then current month
+# ---------------------------------------------------------------------------
+if [ "$MODE" = "recent" ]; then
+    log "INFO" "Running recent: previous month + current month"
+    "$SCRIPT_DIR/bin/backup" monthly || exit 1
+    "$SCRIPT_DIR/bin/backup" monthly "$(date '+%Y-%m')" || exit 1
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # Date helpers — portable across GNU date, BSD date (macOS) and BusyBox (Alpine)
 # Falls back to python3 or node for BusyBox environments.
 # ---------------------------------------------------------------------------
-
-# date_offset YYYY-MM-DD N → date offset by N days (N can be negative)
-date_offset() {
-    _base="$1"; _days="$2"
-    # GNU date (Linux coreutils)
-    if date --version >/dev/null 2>&1; then
-        date -d "${_base} ${_days} days" '+%Y-%m-%d'
-        return
-    fi
-    # BSD date (macOS) — test with -j to distinguish from BusyBox
-    if date -j -f '%Y-%m-%d' "${_base}" '+%Y-%m-%d' >/dev/null 2>&1; then
-        date -j -v"${_days}d" -f '%Y-%m-%d' "${_base}" '+%Y-%m-%d'
-        return
-    fi
-    # BusyBox / fallback — use python3 or node
-    if command -v python3 >/dev/null 2>&1; then
-        python3 -c "from datetime import date,timedelta; print((date.fromisoformat('${_base}')+timedelta(days=${_days})).isoformat(),end='')"
-        return
-    fi
-    node -e "var d=new Date('${_base}');d.setDate(d.getDate()+(${_days}));process.stdout.write(d.toISOString().slice(0,10));"
-}
 
 # prev_month_year_month → prints "YYYY MM" for the previous calendar month
 prev_month_year_month() {
@@ -364,7 +347,6 @@ process.stdout.write(d.getFullYear()+'-'+(('0'+(d.getMonth()+1)).slice(-2))+'-'+
 "
 }
 
-today="$(date '+%Y-%m-%d')"
 current_year="$(date '+%Y')"
 current_month="$(date '+%m')"
 
@@ -372,15 +354,6 @@ current_month="$(date '+%m')"
 # Resolve date range and output paths per mode
 # ---------------------------------------------------------------------------
 case "$MODE" in
-
-    daily)
-        REF_DATE="${PARAM:-$today}"
-        DATE_TO="$(date_offset "$REF_DATE" -1)"
-        DATE_FROM="$(date_offset "$REF_DATE" -7)"
-        BACKUP_SUBDIR="$SCRIPT_DIR/backups/daily"
-        BACKUP_FILE="$BACKUP_SUBDIR/wallet-daily-${REF_DATE}.json"
-        RANGE_DESC="7-day window ($DATE_FROM → $DATE_TO)"
-        ;;
 
     monthly)
         if [ -n "$PARAM" ]; then
@@ -539,7 +512,7 @@ notify_backup_success "$MODE" "$DATE_FROM" "$DATE_TO" \
     "$budget_count" "$label_count" "$BACKUP_FILE"
 
 # ---------------------------------------------------------------------------
-# Cleanup: monthly removes covered daily; yearly removes covered monthly
+# Cleanup: yearly removes covered monthly
 # ---------------------------------------------------------------------------
 cleanup_covered_backups() {
     target_dir="$1"
@@ -563,14 +536,6 @@ cleanup_covered_backups() {
     fi
     log "INFO" "  Removed $cleaned $label file(s) covered by $MODE $match_prefix"
 }
-
-if [ "$MODE" = "monthly" ]; then
-    MONTHLY_MONTH="${TARGET_YEAR}-${TARGET_MONTH}"
-    log "INFO" "Cleaning up daily backups for month $MONTHLY_MONTH..."
-    cleanup_covered_backups \
-        "$SCRIPT_DIR/backups/daily" "wallet-daily-*.json" \
-        "$MONTHLY_MONTH" 7 "daily"
-fi
 
 if [ "$MODE" = "yearly" ]; then
     log "INFO" "Cleaning up monthly backups for year $TARGET_YEAR..."
