@@ -35,8 +35,56 @@ send_telegram() {
     if [ -n "$TELEGRAM_TOKEN" ] && [ -n "$CHAT_ID" ]; then
         if ! curl -sS --max-time 10 -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT_ID}" \
-            --data-urlencode "text=${MESSAGE}" >/dev/null 2>&1; then
+            --data-urlencode "text=${MESSAGE}" \
+            -d "parse_mode=HTML" \
+            -d "disable_web_page_preview=true" >/dev/null 2>&1; then
             log "WARN" "Failed to send Telegram notification"
         fi
     fi
+}
+
+notify_backup_success() {
+    _mode="$1"
+    _date_from="$2"
+    _date_to="$3"
+    _records="$4"
+    _accounts="$5"
+    _categories="$6"
+    _budget="$7"
+    _labels="$8"
+    _file="$(basename "$9")"
+
+    case "$_mode" in
+        daily)   _icon="📅" ;;
+        monthly) _icon="📆" ;;
+        yearly)  _icon="🗓️" ;;
+        *)       _icon="📦" ;;
+    esac
+
+    send_telegram "${_icon} <b>Wallet Backup Complete</b>
+
+Mode: <b>${_mode}</b>
+Period: <code>${_date_from}</code> → <code>${_date_to}</code>
+
+Records: <b>${_records}</b>  ·  Accounts: <b>${_accounts}</b>  ·  Categories: <b>${_categories}</b>
+Budgets: <b>${_budget}</b>  ·  Labels: <b>${_labels}</b>
+
+File: <code>${_file}</code>"
+}
+
+notify_update_success() {
+    _branch="$1"
+    send_telegram "✅ <b>wallet-scripts Updated</b>
+
+Branch: <code>${_branch}</code>
+All scripts have been updated successfully."
+}
+
+notify_error() {
+    _context="$1"
+    _detail="$2"
+    send_telegram "❌ <b>Wallet Scripts: Error</b>
+
+Context: <b>${_context}</b>
+Detail: <code>${_detail}</code>"
 }

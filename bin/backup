@@ -534,7 +534,9 @@ log "INFO" "  budgets:    $budget_count"
 log "INFO" "  labels:     $label_count"
 log "INFO" "  records:    $record_count ($DATE_FROM → $DATE_TO)"
 
-send_telegram "Wallet backup [$MODE] OK — ${record_count} records (${DATE_FROM} → ${DATE_TO}), ${account_count} accounts → $(basename "$BACKUP_FILE")"
+notify_backup_success "$MODE" "$DATE_FROM" "$DATE_TO" \
+    "$record_count" "$account_count" "$category_count" \
+    "$budget_count" "$label_count" "$BACKUP_FILE"
 
 # ---------------------------------------------------------------------------
 # Cleanup: monthly removes covered daily; yearly removes covered monthly
