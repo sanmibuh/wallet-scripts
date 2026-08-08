@@ -100,5 +100,5 @@ if [ $RESULT -eq 2 ]; then
     log "INFO" "No changes detected - already up to date"
 else
     log "INFO" "Update completed successfully"
-    send_telegram "wallet-scripts updated successfully from ${BRANCH}"
+    notify_update_success "$BRANCH"
 fi
